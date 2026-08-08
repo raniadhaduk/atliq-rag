@@ -1,0 +1,9 @@
+streamlit
+groq
+python-dotenv
+sentence-transformers
+qdrant-client
+presidio-analyzer
+presidio-anonymizer
+pandas
+docling
