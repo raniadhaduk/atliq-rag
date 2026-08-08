@@ -2,19 +2,23 @@
 Step 9: Streamlit frontend - wraps our full RAG + RBAC + guardrails
 pipeline in a real web chat interface.
 
-Run with:  streamlit run src\10_app.py
+Run with:  streamlit run src\\10_app.py
 """
 
 import os
+import sys
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchAny
+from qdrant_client.models import Filter, FieldCondition, MatchAny, Distance, VectorParams, PointStruct
 from presidio_analyzer import AnalyzerEngine
+from importlib import import_module
 
 load_dotenv()
+
+sys.path.append("src")
 
 COLLECTION_NAME = "atliq_docs"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -31,9 +35,62 @@ ROLE_PERMISSIONS = {
 }
 
 
+# --- Cache expensive resources so they only load ONCE, not on every rerun ---
+# Streamlit reruns the whole script on every interaction, so without
+# caching we'd reload the embedding model and reconnect to Qdrant/Groq
+# every single time the user typed something. @st.cache_resource fixes this.
+
 @st.cache_resource
 def load_embedding_model():
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+
+def ensure_vector_store_exists(client, embed_model):
+    """
+    On a fresh deployment (e.g. Streamlit Community Cloud), the local
+    qdrant_storage/ folder won't exist yet - it's gitignored on purpose,
+    since it's just a rebuildable cache of the source documents.
+
+    This function checks whether our collection already exists. If not,
+    it runs the full ingestion -> chunking -> embedding pipeline once,
+    on startup, so the app is self-sufficient on any fresh environment.
+    """
+    if client.collection_exists(COLLECTION_NAME):
+        return  # already built (e.g. running locally after step 03 was run)
+
+    st.info("First-time setup: building the knowledge base from source documents. This runs once.")
+
+    ingest = import_module("01_ingest_documents")
+    chunker = import_module("02_chunk_documents")
+
+    documents = ingest.load_all_documents()
+    chunks = chunker.chunk_documents(documents)
+
+    vector_size = embed_model.get_sentence_embedding_dimension()
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+    )
+
+    texts = [c["text"] for c in chunks]
+    embeddings = embed_model.encode(texts, show_progress_bar=False)
+
+    points = [
+        PointStruct(
+            id=i,
+            vector=embedding.tolist(),
+            payload={
+                "text": chunk["text"],
+                "department": chunk["department"],
+                "filename": chunk["filename"],
+                "source_path": chunk["source_path"],
+                "chunk_index": chunk["chunk_index"],
+            },
+        )
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+    ]
+
+    client.upsert(collection_name=COLLECTION_NAME, points=points)
 
 
 @st.cache_resource
@@ -147,6 +204,7 @@ st.set_page_config(page_title="AtliQ RAG Assistant", page_icon="🤖", layout="w
 st.title("🤖 AtliQ Corp Internal Assistant")
 st.caption("RAG-powered chatbot with Role-Based Access Control and Guardrails")
 
+# --- Sidebar: role selection (this replaces our old terminal login prompt) ---
 with st.sidebar:
     st.header("Login")
     role = st.selectbox(
@@ -166,14 +224,19 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+# --- Load models once (cached) ---
 embed_model = load_embedding_model()
 qdrant_client = load_qdrant_client()
 groq_client = load_groq_client()
 pii_analyzer = load_pii_analyzer()
 
+ensure_vector_store_exists(qdrant_client, embed_model)
+
+# --- Chat history stored in Streamlit's session state (persists across reruns) ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Re-render past messages
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -184,13 +247,16 @@ for msg in st.session_state.messages:
         if msg.get("pii_found"):
             st.warning(f"⚠️ PII detected in source context: {', '.join(msg['pii_found'])}")
 
+# --- Chat input box ---
 question = st.chat_input("Ask a question about AtliQ Corp's internal data...")
 
 if question:
+    # Show the user's message immediately
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
+    # Run the pipeline and show the answer
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             result = ask_question(question, role, embed_model, qdrant_client, groq_client, pii_analyzer)
