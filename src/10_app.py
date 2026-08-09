@@ -2,7 +2,7 @@
 Step 9: Streamlit frontend - wraps our full RAG + RBAC + guardrails
 pipeline in a real web chat interface.
 
-Run with:  streamlit run src\\10_app.py
+Run with:  streamlit run src\10_app.py
 """
 
 import os
@@ -36,10 +36,6 @@ ROLE_PERMISSIONS = {
 
 
 # --- Cache expensive resources so they only load ONCE, not on every rerun ---
-# Streamlit reruns the whole script on every interaction, so without
-# caching we'd reload the embedding model and reconnect to Qdrant/Groq
-# every single time the user typed something. @st.cache_resource fixes this.
-
 @st.cache_resource
 def load_embedding_model():
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -105,7 +101,21 @@ def load_groq_client():
 
 @st.cache_resource
 def load_pii_analyzer():
-    return AnalyzerEngine()
+    # Presidio defaults to the LARGE spacy model (~400MB), which fails to
+    # download at runtime on Streamlit Cloud (no write permission for
+    # on-the-fly installs there). We explicitly configure it to use the
+    # SMALL model instead, which we install as a normal pip dependency
+    # at build time via requirements.txt.
+    from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+    nlp_configuration = {
+        "nlp_engine_name": "spacy",
+        "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
+    }
+    provider = NlpEngineProvider(nlp_configuration=nlp_configuration)
+    nlp_engine = provider.create_engine()
+
+    return AnalyzerEngine(nlp_engine=nlp_engine)
 
 
 def retrieve_chunks(question, model, client, allowed_departments, top_k=TOP_K):
